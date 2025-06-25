@@ -10,6 +10,8 @@ from ..utils import (compute_swizzled_sf_shape, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
 
+import math
+
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
@@ -755,3 +757,108 @@ def _(
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
     return output_act, output_sf
+
+class GemmAllReduceRunner:
+    # avoid overhead of creating a new runner in forward pass
+    # shared between all instances of GemmAllReduceRunner
+    _runner_dict = dict()
+
+    def __init__(self, max_problem_shape, rank, tp_group ,a_dtype, b_dtype, output_dtype, input_use_fp4, sf_use_ue8m0):
+
+        self.output_dtype = output_dtype
+        self.tp_rank = rank
+        self.tp_group = list(tp_group)
+
+        # bucket_num_tokens = self.get_bucket_num_tokens(max_problem_shape[0])
+        # (M, N, K)
+        # problem_shape = (bucket_num_tokens,) + max_problem_shape[1:]
+
+        print("bucket_problem_shape", max_problem_shape)
+
+        self.instance_key = (max_problem_shape, a_dtype, b_dtype, output_dtype, input_use_fp4, sf_use_ue8m0)
+
+        constructor_args = self.instance_key + (self.tp_rank, self.tp_group)
+
+        if self.instance_key not in GemmAllReduceRunner._runner_dict:
+            print("--------------- CREATE NEW GEMM RUNNER v2 -------------------")
+            # Our internal implementation does not use pytorch cache allocators, so we need to
+            # allocate our runner up front (not during runtime) so that it works with cuda graphs.
+            self._runner_dict[self.instance_key] = torch.classes.trtllm.GemmAllReduceRunner(*constructor_args)
+ 
+        self.gemm_runner = self._runner_dict[self.instance_key]
+
+    def __call__(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+
+        act, weight, act_sf, weight_sf, alpha = inputs
+
+        print("act.shape", act.shape)
+        print("weight.shape", weight.shape)
+
+        # bucket_num_tokens = self.get_bucket_num_tokens(act.shape[0])
+        # (M, N, K)
+        # problem_shape = (bucket_num_tokens, weight.shape[0], weight.shape[1])
+
+        # constructor_args = (problem_shape,) + self.instance_key[1:] + (self.tp_rank, self.tp_group)
+
+        # curr_instance_key = (problem_shape,) + self.instance_key[1:]
+
+        # if curr_instance_key not in GemmAllReduceRunner._runner_dict:
+        #     print("--------------- CREATE NEW GEMM RUNNER v2 -------------------")
+        #     # We do not rely on pytorch cache allocators.
+        #     # Instead we manually manage the memory.
+        #     # constructor_args = curr_instance_key + (self.tp_rank, self.tp_group)
+        #     self._runner_dict[curr_instance_key] = torch.classes.trtllm.GemmAllReduceRunner(*constructor_args)
+
+        # gemm_runner = self._runner_dict[curr_instance_key]
+        # out = torch.empty(act.shape[0], problem_shape[1], dtype=self.output_dtype, device=act.device)
+        # return out
+        out = self.gemm_runner.runGemm(act, weight, act_sf, weight_sf, alpha)
+        print("out.shape", out.shape)
+        return out
+
+    def get_bucket_num_tokens(self, num_tokens):
+        '''
+        Determines the bucket that num_tokens belongs to, and
+        returns the max number of tokens in that bucket.
+        '''
+        min_num_tokens = 4096
+        if num_tokens == 0:
+            return min_num_tokens
+        bucket = math.ceil(math.log2(num_tokens))
+        bucket_max_num_tokens = 2**bucket
+        return max(bucket_max_num_tokens, min_num_tokens)
+
+
+@torch.library.custom_op("trtllm::fused_gemm_allreduce", mutates_args=())
+def fused_gemm_allreduce(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    tp_rank: int,
+    tp_group: List[int],
+    input_use_fp4: bool = False,
+    sf_use_ue8m0: bool = False,
+) -> torch.Tensor:
+
+    # allocate workspace if not already allocated
+    gemm_allreduce_runner = GemmAllReduceRunner(tp_rank, tp_group, act.dtype, weight.dtype, output_dtype, input_use_fp4, sf_use_ue8m0)
+
+    return gemm_allreduce_runner(inputs=[act, weight, act_sf, weight_sf, alpha])
+
+@fused_gemm_allreduce.register_fake
+def _(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    tp_rank: int,
+    tp_group: List[int],
+    input_use_fp4: bool = False,
+    sf_use_ue8m0: bool = False,
+) -> torch.Tensor:
+    return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)

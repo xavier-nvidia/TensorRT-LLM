@@ -16,6 +16,7 @@ from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import GemmAllReduceRunner
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
@@ -174,6 +175,10 @@ class LinearMethodBase(ABC):
               bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
 
+    @abstractmethod
+    def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
+        raise NotImplementedError
+
     def load_weights(self, module: Linear, weights: List[Dict],
                      weight_mode: WeightMode):
         """
@@ -242,6 +247,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = F.linear(input, module.weight, bias)
         return output
 
+    def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
+        # Nothing to do.
+        return input, None
+
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights)
 
@@ -284,26 +293,14 @@ class FP8QDQLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        cur_input_scale = module.input_scale
-        if input.dtype != torch.float8_e4m3fn:
-            if module.input_scale is not None:
-                # Static quantization
-                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    input, module.input_scale)
-            else:
-                # Dynamic quantization
-                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
-                    input)
-                cur_input_scale = cur_input_scale.to(torch.float32)
 
-        else:
-            qinput = input
+        qinput, input_sf = self.quantize_input(module, input)
 
         # This op does not support bias now.
         output = torch.ops.trtllm.cublas_scaled_mm(
             qinput,
             module.weight.t(),
-            scale_a=cur_input_scale,
+            scale_a=input_sf,
             scale_b=module.weight_scale,
             bias=None,
             out_dtype=module.dtype or input.dtype,
@@ -311,6 +308,21 @@ class FP8QDQLinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
+        input_sf = module.input_scale
+        if input.dtype != torch.float8_e4m3fn:
+            if module.input_scale is not None:
+                # Static quantization
+                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    input, module.input_scale)
+            else:
+                # Dynamic quantization
+                qinput, input_sf = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
+                input_sf = input_sf.to(torch.float32)
+        else:
+            qinput = input
+        return qinput, input_sf
 
     def load_weight_scales(self, weights: List[Dict]):
         input_scale, weight_scale = [], []
@@ -408,17 +420,21 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        if input.dtype == torch.float8_e4m3fn:
-            input = input.to(torch.bfloat16) * module.input_scale
-        assert input.dtype == torch.bfloat16
 
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
-
+        act_input_fp8, act_input_sf = self.quantize_input(module, input)
+        
         output = torch.ops.trtllm.fp8_block_scaling_gemm(
             act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         if bias is not None:
             output = output + bias
         return output
+
+    def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
+        if input.dtype == torch.float8_e4m3fn:
+            input = input.to(torch.bfloat16) * module.input_scale
+        assert input.dtype == torch.bfloat16
+
+        return torch.ops.trtllm.fp8_quantize_1x128(input)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
@@ -510,12 +526,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.register_parameter("bias", None)
 
     def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
-        if isinstance(input, Fp4QuantizedTensor):
-            act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
-        else:
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                input, module.input_scale, module.scaling_vector_size, False)
+              bias: Optional[torch.Tensor], *args, **kwargs):
+
+        act_fp4, act_sf = self.quantize_input(module, input)
 
         output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
                                              module.weight_scale, module.alpha,
@@ -523,6 +536,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
+        if isinstance(input, Fp4QuantizedTensor):
+            return input.fp4_tensor, input.scaling_factor
+        else:
+            return torch.ops.trtllm.fp4_quantize(
+                input, module.input_scale, module.scaling_vector_size, False)
 
     def load_weight_scales(self,
                            weights: List[Dict],
@@ -641,6 +661,65 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return NVFP4LinearMethod()
     raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
+# Fuses allreduce and linear method together.
+class DistributedRowLinearMethod(LinearMethodBase):
+    def __init__(self, mapping: Mapping, max_num_tokens: int, quant_config: Optional[QuantConfig] = None):
+        self.quant_method = get_quant_method(quant_config)
+        self.has_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
+        self.mapping = mapping 
+        self.max_num_tokens = max_num_tokens
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype, *args,
+                       **kwargs):
+        self.quant_method.create_weights(module, in_features, out_features, bias, dtype, *args, **kwargs)
+
+        # Activation type will be same as weight type for now.
+        # TODO: When we support mixed precision, we need to handle this differently.
+        act_dtype = module.weight.dtype   
+
+        max_problem_shape = (self.max_num_tokens, module.weight.shape[0], module.weight.shape[1])     
+        print("max_problem_shape", max_problem_shape)
+
+        # Cannot allocate during runtime as it will break with cuda graphs.
+        self.gemm = GemmAllReduceRunner(max_problem_shape, self.mapping.tp_rank, list(self.mapping.tp_group), act_dtype, module.weight.dtype, dtype, self.has_nvfp4, False)
+
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor], *args, **kwargs):
+        
+        act, act_sf = self.quantize_input(module, input)
+
+        num_tokens = input.shape[0]
+        assert num_tokens <= self.max_num_tokens, f"num_tokens {num_tokens} must <= max_num_tokens {self.max_num_tokens} configured in DistributedRowLinear"
+
+        print("calling into fused_gemm_allreduce, rank", self.mapping.rank)
+        output = self.gemm(inputs=[act, module.weight, act_sf, module.weight_scale, module.alpha])
+
+        # output = torch.ops.trtllm.fused_gemm_allreduce(
+        #     act, module.weight, act_sf, module.weight_scale, module.alpha, module.dtype, self.mapping.tp_rank, list(self.mapping.tp_group), self.has_nvfp4)
+
+        if bias is not None:
+            # tmp = torch.empty_like(output)
+            output = output + bias
+        
+        return output
+        
+
+    def quantize_input(self, module: Linear, input: torch.Tensor, *args, **kwargs):
+        return self.quant_method.quantize_input(module, input, *args, **kwargs)
+
+    def load_weight_scales(self, weights: List[Dict]):
+        return self.quant_method.load_weight_scales(weights)
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+        self.quant_method.load_weights_vanilla(module, weights)
+
+    def load_weights_fused_qkv_linear(self, module: Linear, weights: List[Dict]):
+        self.quant_method.load_weights_fused_qkv_linear(module, weights)
+
+    def load_weights_fused_gate_up_linear(self, module: Linear, weights: List[Dict]):
+        self.quant_method.load_weights_fused_gate_up_linear(module, weights)
 
 class Linear(nn.Module):
 
@@ -660,6 +739,7 @@ class Linear(nn.Module):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+        max_num_tokens: int = 8192,
     ):
         from ..distributed import AllReduce
 
@@ -696,14 +776,20 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(
-            mapping=self.mapping,
-            strategy=allreduce_strategy) if reduce_output else None
+        self.fuse_gemm_allreduce = reduce_output and allreduce_strategy == AllReduceStrategy.FUSE_WITH_GEMM
+        if not self.fuse_gemm_allreduce:
+            self.all_reduce = AllReduce(
+                mapping=self.mapping,
+                strategy=allreduce_strategy) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
+        self.max_num_tokens = max_num_tokens
 
+        if self.fuse_gemm_allreduce:
+            print("------------- USING FUSE_WITH_GEMM -------------")
+        
         if not skip_create_weights_in_init:
             self.create_weights()
 
@@ -711,7 +797,13 @@ class Linear(nn.Module):
         if self._weights_created:
             return
 
-        self.quant_method = get_quant_method(self.quant_config)
+        if self.fuse_gemm_allreduce:
+            print("Using DistributedRowLinearMethod")
+            self.quant_method = DistributedRowLinearMethod(self.mapping, self.max_num_tokens, self.quant_config)
+        else:
+            print("Using get_quant_method")
+            self.quant_method = get_quant_method(self.quant_config)
+
         self.quant_method.create_weights(self, self.in_features,
                                          self.out_features, self.has_bias,
                                          self.dtype)
@@ -747,6 +839,7 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
+
         output = self.quant_method.apply(self, input, bias)
 
         if self.lora is not None and bool(lora_params):
@@ -783,14 +876,18 @@ class Linear(nn.Module):
         if self.tp_mode == TensorParallelMode.ROW:
             bias = None if (self.tp_rank > 0) else self.bias
             if self.reduce_output:
-                fuse_bias = self._maybe_fuse_bias_into_allreduce(
-                    bias, all_reduce_params)
-                bias = None if fuse_bias else bias
-                output = self.apply_linear(input, bias, lora_params, layer_idx)
-                output = self.all_reduce(
-                    output,
-                    all_reduce_params=all_reduce_params,
-                )
+                print("reduce_output")
+                if self.fuse_gemm_allreduce:
+                    output = self.apply_linear(input, bias, lora_params, layer_idx)
+                else:
+                    fuse_bias = self._maybe_fuse_bias_into_allreduce(
+                        bias, all_reduce_params)
+                    bias = None if fuse_bias else bias
+                    output = self.apply_linear(input, bias, lora_params, layer_idx)
+                    output = self.all_reduce(
+                        output,
+                        all_reduce_params=all_reduce_params,
+                    )
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
